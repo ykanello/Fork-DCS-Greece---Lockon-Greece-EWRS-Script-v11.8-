@@ -1,0 +1,351 @@
+--- "/mnt/data/DCS Greece - Lockon Greece EWRS v11.8.lua"	2026-05-11 18:08:57.385041711 +0000
++++ /mnt/data/EWRS_v11.9_geometry_fork.lua	2026-05-11 18:12:33.683002192 +0000
+@@ -1,5 +1,5 @@
+ --=====================================================
+--- DCS Greece - Lockon Greece EWRS Script v11.8 
++-- DCS Greece - Lockon Greece EWRS Script v11.9-geometry-fork 
+ --=====================================================
+ 
+ env.info("EWRS: Starting Early Warning Radar System")
+@@ -61,6 +61,63 @@
+     },
+     
+     only_armed_ships = true,
++
++    -- ===== RADAR GEOMETRY / ELEVATION FILTER =====
++    -- This layer makes EWRS radar-type aware.
++    -- Unprofiled radars keep the original EWRS behavior by default.
++    -- To make the filter stricter, set default_policy = "BLOCK" and define default_profile.
++    radar_geometry = {
++        enable = true,
++        log_rejections = false,
++        log_accepts = false,
++
++        -- "ALLOW" = radars without a profile behave normally.
++        -- "BLOCK" = radars without a profile are ignored unless default_profile is defined.
++        default_policy = "ALLOW",
++
++        -- Approximation notes:
++        -- 1. DCS altitude is MSL, not AGL.
++        -- 2. This does not model terrain masking between radar and target.
++        -- 3. The curvature model uses the common radar-horizon approximation.
++        -- 4. Values are gameplay-tunable profiles, not a certified technical manual.
++        profiles_by_type = {
++            -- 55G6 Tall Rack / Nebo-style 3D EWR profile.
++            -- Good strategic picture, poor low-altitude far picture.
++            ["55G6 EWR"] = {
++                name = "55G6 Tall Rack / Nebo EWR",
++                maxRangeNm = 150,
++                minElevationDeg = 2,
++                maxElevationDeg = 16,
++                antennaHeightM = 10,
++                useRadarHorizon = true,
++            },
++        },
++
++        -- Fallback substring matching helps if DCS / map / mod type names vary slightly.
++        profiles_by_substring = {
++            {
++                match = "55G6",
++                profile = {
++                    name = "55G6 Tall Rack / Nebo EWR",
++                    maxRangeNm = 150,
++                    minElevationDeg = 2,
++                    maxElevationDeg = 16,
++                    antennaHeightM = 10,
++                    useRadarHorizon = true,
++                }
++            },
++        },
++
++        -- Example for later expansion:
++        -- profiles_by_type["p-19 s-125 sr"] = {
++        --     name = "P-19 Flat Face",
++        --     maxRangeNm = 50,
++        --     minElevationDeg = 0.5,
++        --     maxElevationDeg = 30,
++        --     antennaHeightM = 8,
++        --     useRadarHorizon = true,
++        -- }
++    },
+ }
+ 
+ -----------------------------------------------------
+@@ -128,6 +185,92 @@
+ end
+ 
+ -----------------------------------------------------
++-- RADAR GEOMETRY / ELEVATION FILTER HELPERS
++-----------------------------------------------------
++local EWRS_GEOM = {
++    NM_TO_M = 1852,
++    M_TO_FT = 3.28084,
++    NM_TO_FT = 6076.12,
++}
++
++local function geomDegToRad(deg)
++    return deg * math.pi / 180
++end
++
++local function geomHorizontalRangeM(a, b)
++    local dx = a.x - b.x
++    local dz = a.z - b.z
++    return math.sqrt(dx * dx + dz * dz)
++end
++
++-- Common radar-horizon approximation:
++-- range_nm = 1.23 * (sqrt(radar_alt_ft) + sqrt(target_alt_ft))
++-- This returns the minimum target altitude MSL required by curvature alone.
++local function geomRadarHorizonMinTargetFt(rangeNm, radarAltFt)
++    local term = (rangeNm / 1.23) - math.sqrt(math.max(radarAltFt, 0))
++
++    if term <= 0 then
++        return 0
++    end
++
++    return term * term
++end
++
++local function geomGetUnitType(unit)
++    local ok, unitType = pcall(function() return unit:getTypeName() end)
++    if ok and unitType then
++        return unitType
++    end
++    return "UNKNOWN"
++end
++
++local function geomGetRadarProfile(radar)
++    local cfg = Config.EWRS.radar_geometry
++
++    if not cfg or not cfg.enable then
++        return nil, "GEOMETRY_DISABLED"
++    end
++
++    local unitType = geomGetUnitType(radar)
++
++    if cfg.profiles_by_type and cfg.profiles_by_type[unitType] then
++        return cfg.profiles_by_type[unitType], unitType
++    end
++
++    if cfg.profiles_by_substring then
++        for _, rule in ipairs(cfg.profiles_by_substring) do
++            if rule.match and rule.profile and string.find(unitType, rule.match, 1, true) then
++                return rule.profile, rule.match
++            end
++        end
++    end
++
++    if cfg.default_policy == "BLOCK" and cfg.default_profile then
++        return cfg.default_profile, "DEFAULT"
++    end
++
++    return nil, "UNPROFILED_ALLOWED"
++end
++
++local function geomLogReject(radar, targetObj, reason)
++    local cfg = Config.EWRS.radar_geometry
++    if cfg and cfg.log_rejections then
++        env.info("EWRS GEOM: reject radar=" .. geomGetUnitType(radar) ..
++                 " target=" .. (targetObj and targetObj:getName() or "UNKNOWN") ..
++                 " reason=" .. tostring(reason))
++    end
++end
++
++local function geomLogAccept(radar, targetObj, profileName)
++    local cfg = Config.EWRS.radar_geometry
++    if cfg and cfg.log_accepts then
++        env.info("EWRS GEOM: accept radar=" .. geomGetUnitType(radar) ..
++                 " target=" .. (targetObj and targetObj:getName() or "UNKNOWN") ..
++                 " profile=" .. tostring(profileName))
++    end
++end
++
++-----------------------------------------------------
+ -- EWRS CLASS
+ -----------------------------------------------------
+ EWRS = {}
+@@ -150,6 +293,83 @@
+ end
+ 
+ -----------------------------------------------------
++-- Radar Geometry Filter
++-----------------------------------------------------
++function EWRS:radarCanSeeTarget(radar, targetObj)
++    local cfg = Config.EWRS.radar_geometry
++
++    if not cfg or not cfg.enable then
++        return true
++    end
++
++    if not radar or not radar:isExist() or not targetObj or not targetObj:isExist() then
++        return false
++    end
++
++    local profile, profileKey = geomGetRadarProfile(radar)
++
++    -- Original EWRS behavior for radars without a profile.
++    if not profile then
++        if cfg.default_policy == "BLOCK" then
++            geomLogReject(radar, targetObj, "unprofiled radar blocked")
++            return false
++        end
++        return true
++    end
++
++    local okRadar, radarPoint = pcall(function() return radar:getPoint() end)
++    local okTarget, targetPoint = pcall(function() return targetObj:getPoint() end)
++
++    if not okRadar or not radarPoint or not okTarget or not targetPoint then
++        geomLogReject(radar, targetObj, "missing point")
++        return false
++    end
++
++    local rangeM = geomHorizontalRangeM(radarPoint, targetPoint)
++    local rangeNm = rangeM / EWRS_GEOM.NM_TO_M
++
++    if profile.maxRangeNm and rangeNm > profile.maxRangeNm then
++        geomLogReject(radar, targetObj, string.format("range %.1f nm > %.1f nm", rangeNm, profile.maxRangeNm))
++        return false
++    end
++
++    local antennaHeightM = profile.antennaHeightM or 0
++    local radarAltFt = (radarPoint.y + antennaHeightM) * EWRS_GEOM.M_TO_FT
++    local targetAltFt = targetPoint.y * EWRS_GEOM.M_TO_FT
++    local rangeFt = rangeNm * EWRS_GEOM.NM_TO_FT
++
++    local horizonMinFt = 0
++    if profile.useRadarHorizon ~= false then
++        horizonMinFt = geomRadarHorizonMinTargetFt(rangeNm, radarAltFt)
++    end
++
++    local minAltitudeFt = horizonMinFt
++    if profile.minElevationDeg then
++        minAltitudeFt = minAltitudeFt + math.tan(geomDegToRad(profile.minElevationDeg)) * rangeFt
++    end
++
++    local maxAltitudeFt = math.huge
++    if profile.maxElevationDeg then
++        maxAltitudeFt = horizonMinFt + math.tan(geomDegToRad(profile.maxElevationDeg)) * rangeFt
++    end
++
++    if targetAltFt < minAltitudeFt then
++        geomLogReject(radar, targetObj,
++            string.format("alt %.0f ft < min %.0f ft at %.1f nm", targetAltFt, minAltitudeFt, rangeNm))
++        return false
++    end
++
++    if targetAltFt > maxAltitudeFt then
++        geomLogReject(radar, targetObj,
++            string.format("alt %.0f ft > max %.0f ft at %.1f nm", targetAltFt, maxAltitudeFt, rangeNm))
++        return false
++    end
++
++    geomLogAccept(radar, targetObj, profile.name or profileKey)
++    return true
++end
++
++-----------------------------------------------------
+ -- Radar Cache
+ -----------------------------------------------------
+ function EWRS:cacheRadars()
+@@ -212,27 +432,37 @@
+ function EWRS:detectRadarContacts()
+     local contacts = {}
+     local detected_units = {}
+-    local active_radars = {}
++    local cached_radars = {}
++    local active_count = 0
+     
+-    env.info("EWRS: Starting detection with " .. #self.radars .. " radars")
++    env.info("EWRS: Starting detection with " .. #self.radars .. " cached radars")
+     
+     for _, radar in ipairs(self.radars) do
+-        if radar and radar:isExist() and radar:isActive() then
+-            active_radars[#active_radars + 1] = radar
++        if radar and radar:isExist() then
++            -- Keep inactive radars cached. This matters when external scripts cycle
++            -- radar emission ON/OFF; otherwise EWRS would forget them until cache refresh.
++            cached_radars[#cached_radars + 1] = radar
+             
+-            local controller = radar:getController()
+-            if controller then
+-                local detected = controller:getDetectedTargets()
++            if radar:isActive() then
++                active_count = active_count + 1
+                 
+-                if detected then
+-                    for _, target in ipairs(detected) do
+-                        if target and target.object and target.object:isExist() then
+-                            local targetObj = target.object
+-                            local targetName = targetObj:getName()
+-                            
+-                            if not detected_units[targetName] then
+-                                detected_units[targetName] = true
+-                                table.insert(contacts, targetObj)
++                local controller = radar:getController()
++                if controller then
++                    local detected = controller:getDetectedTargets()
++                    
++                    if detected then
++                        for _, target in ipairs(detected) do
++                            if target and target.object and target.object:isExist() then
++                                local targetObj = target.object
++                                
++                                if self:radarCanSeeTarget(radar, targetObj) then
++                                    local targetName = targetObj:getName()
++                                    
++                                    if not detected_units[targetName] then
++                                        detected_units[targetName] = true
++                                        table.insert(contacts, targetObj)
++                                    end
++                                end
+                             end
+                         end
+                     end
+@@ -241,9 +471,9 @@
+         end
+     end
+     
+-    self.radars = active_radars
++    self.radars = cached_radars
+     
+-    env.info("EWRS: Active radars after cleanup: " .. #self.radars)
++    env.info("EWRS: Active radars: " .. active_count .. " / cached radars after cleanup: " .. #self.radars)
+     env.info("EWRS: Detected " .. #contacts .. " contacts")
+     return contacts
+ end
+@@ -270,7 +500,7 @@
+                         for _, target in ipairs(detected) do
+                             if target and target.object and target.object:isExist() then
+                                 local targetObj = target.object
+-                                if targetObj:getName() == player_name then
++                                if targetObj:getName() == player_name and self:radarCanSeeTarget(radar, targetObj) then
+                                     table.insert(tracking_radars, radar)
+                                     break
+                                 end
+@@ -284,7 +514,6 @@
+     
+     return tracking_radars
+ end
+-
+ -----------------------------------------------------
+ -- Search Theatre
+ -----------------------------------------------------
+@@ -1133,7 +1362,7 @@
+ 
+ if Config.EWRS.enable then
+ 
+-    env.info("EWRS: Initializing HARDENED v11.7")
++    env.info("EWRS: Initializing HARDENED v11.9 geometry fork")
+ 
+     EWRS_coalition = {
+         [coalition.side.BLUE] = EWRS:new(coalition.side.BLUE),
+@@ -1304,7 +1533,7 @@
+ 
+     end, {}, timer.getTime() + 3)
+ 
+-    trigger.action.outText("Lock-On Greece / DCS World Greece - EWRS v11.8", 20)
++    trigger.action.outText("Lock-On Greece / DCS World Greece - EWRS v11.9 geometry fork", 20)
+ 
+ else
+     env.info("EWRS: Disabled")
