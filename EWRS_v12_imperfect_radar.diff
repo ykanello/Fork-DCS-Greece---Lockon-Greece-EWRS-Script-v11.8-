@@ -1,0 +1,784 @@
+--- /mnt/data/EWRS_v11.9_geometry_fork.lua	2026-05-11 18:35:13.074313878 +0000
++++ /mnt/data/EWRS_v12_imperfect_radar.lua	2026-05-11 18:39:51.256756838 +0000
+@@ -1,5 +1,5 @@
+ --=====================================================
+--- DCS Greece - Lockon Greece EWRS Script v11.9-geometry-fork 
++-- DCS Greece - Lockon Greece EWRS Script v12.0-imperfect-radar-fork 
+ --=====================================================
+ 
+ env.info("EWRS: Starting Early Warning Radar System")
+@@ -9,6 +9,8 @@
+     return
+ end
+ 
++math.randomseed(math.floor(timer.getAbsTime() * 1000))
++
+ Config = Config or {}
+ Config.EWRS = {
+     enable = true,
+@@ -118,6 +120,92 @@
+         --     useRadarHorizon = true,
+         -- }
+     },
++
++    -- ===== IMPERFECT RADAR SCAN / TRACK MODEL =====
++    -- This layer simulates rotating radar updates and operator/track confidence.
++    -- Geometry says whether a target can be seen. This section says whether the
++    -- radar has scanned often enough to turn hits into a usable EWRS/GCI contact.
++    radar_scan_model = {
++        enable = true,
++
++        -- If true, the scan model starts immediately when EWRS starts.
++        -- If false, start it later from a trigger with: EWRS_IMPERFECT_RADAR.start()
++        auto_start = true,
++
++        -- How often the internal scan scheduler wakes up. This is not the radar
++        -- rotation rate. Individual radar profiles define scanPeriodSec.
++        scheduler_interval = 1,
++
++        -- Backward compatibility:
++        -- unprofiled_live_passthrough = true means radars without a scan profile
++        -- behave like original EWRS: live DCS detections are accepted immediately.
++        unprofiled_live_passthrough = true,
++
++        -- If true, a confirmed track uses the last known point until memory expires.
++        -- This creates the intended stale/laggy GCI picture.
++        show_stale_tracks = true,
++
++        -- If true, dead/despawned targets are removed even if track memory remains.
++        drop_dead_targets = true,
++
++        -- Logging knobs for tuning in dcs.log.
++        log_state_changes = false,
++        log_scans = false,
++        log_tracks = false,
++
++        profiles_by_type = {
++            ["55G6 EWR"] = {
++                name = "55G6 Tall Rack / Nebo EWR",
++
++                -- Antenna/update model. Public/open sources commonly describe
++                -- roughly 10-second information update behaviour for Nebo/55G6-family EWR.
++                scanPeriodSec = 10,
++
++                -- Track confirmation model. Three good sweeps before EWRS reports it.
++                hitsToConfirm = 3,
++                requiredConsecutiveHits = true,
++
++                -- Track memory model. After staleAfterSec, reports use old data;
++                -- after trackMemorySec, EWRS drops the track.
++                staleAfterSec = 35,
++                trackMemorySec = 100,
++
++                -- Emission/on-off cycle. This prevents EWRS sampling on a perfect clock.
++                -- First ON happens 30 seconds after scan model start.
++                useEmissionCycle = true,
++                initialDelaySec = 30,
++                onMinSec = 25,
++                onMaxSec = 40,
++                offMinSec = 30,
++                offMaxSec = 90,
++
++                -- true = actually toggle the DCS radar controller on/off.
++                -- false = EWRS-only simulation; radar still emits in DCS.
++                forceDcsOnOff = true,
++            },
++        },
++
++        profiles_by_substring = {
++            {
++                match = "55G6",
++                profile = {
++                    name = "55G6 Tall Rack / Nebo EWR",
++                    scanPeriodSec = 10,
++                    hitsToConfirm = 3,
++                    requiredConsecutiveHits = true,
++                    staleAfterSec = 35,
++                    trackMemorySec = 100,
++                    useEmissionCycle = true,
++                    initialDelaySec = 30,
++                    onMinSec = 25,
++                    onMaxSec = 40,
++                    offMinSec = 30,
++                    offMaxSec = 90,
++                    forceDcsOnOff = true,
++                }
++            },
++        },
++    },
+ }
+ 
+ -----------------------------------------------------
+@@ -271,6 +359,104 @@
+ end
+ 
+ -----------------------------------------------------
++-- IMPERFECT RADAR SNAPSHOT OBJECT
++-----------------------------------------------------
++-- Confirmed/stale radar tracks are stored as snapshots. The snapshot implements
++-- enough Unit-like methods for the original EWRS display code to keep working,
++-- while returning the last known point instead of magical live truth.
++local EWRSContactSnapshot = {}
++EWRSContactSnapshot.__index = EWRSContactSnapshot
++
++function EWRSContactSnapshot:isExist()
++    if self.dropDeadTargets and self.liveUnit then
++        local ok, exists = pcall(function() return self.liveUnit:isExist() end)
++        if not ok or not exists then
++            return false
++        end
++    end
++
++    local now = timer.getTime()
++    return (now - (self.lastSeen or 0)) <= (self.trackMemorySec or 0)
++end
++
++function EWRSContactSnapshot:getName() return self.name end
++function EWRSContactSnapshot:getCoalition() return self.coalition end
++function EWRSContactSnapshot:getDesc() return self.desc end
++function EWRSContactSnapshot:getTypeName() return self.typeName end
++function EWRSContactSnapshot:getPoint() return {x = self.point.x, y = self.point.y, z = self.point.z} end
++function EWRSContactSnapshot:getVelocity() return {x = self.velocity.x, y = self.velocity.y, z = self.velocity.z} end
++
++function EWRSContactSnapshot:getPlayerName()
++    if self.liveUnit then
++        local ok, playerName = pcall(function() return self.liveUnit:getPlayerName() end)
++        if ok then return playerName end
++    end
++    return nil
++end
++
++function EWRSContactSnapshot:hasAttribute(attr)
++    return self.attributes and self.attributes[attr] or false
++end
++
++local function scanSafeUnitName(unit)
++    if not unit then return "UNKNOWN" end
++    local ok, name = pcall(function() return unit:getName() end)
++    if ok and name then return name end
++    return "UNKNOWN"
++end
++
++local function scanRandomBetween(minVal, maxVal)
++    minVal = minVal or 0
++    maxVal = maxVal or minVal
++    if maxVal < minVal then maxVal = minVal end
++    return minVal + math.random() * (maxVal - minVal)
++end
++
++local function scanLog(msg)
++    env.info("EWRS SCAN: " .. msg)
++end
++
++local function scanCaptureSnapshot(targetObj, radar, profile, now, status)
++    local okPoint, point = pcall(function() return targetObj:getPoint() end)
++    local okVel, velocity = pcall(function() return targetObj:getVelocity() end)
++    local okDesc, desc = pcall(function() return targetObj:getDesc() end)
++    local okCoalition, coal = pcall(function() return targetObj:getCoalition() end)
++    local okType, typeName = pcall(function() return targetObj:getTypeName() end)
++
++    if not okPoint or not point then
++        return nil
++    end
++
++    velocity = (okVel and velocity) or {x = 0, y = 0, z = 0}
++    desc = (okDesc and desc) or {category = nil, typeName = okType and typeName or "UNKNOWN"}
++    typeName = (okType and typeName) or desc.typeName or "UNKNOWN"
++
++    local attrs = {}
++    for _, attr in ipairs({"SAM SR", "SAM TR", "EWR", "Ships", "AWACS", "AEW", "Fighters", "Bombers"}) do
++        local okAttr, has = pcall(function() return targetObj:hasAttribute(attr) end)
++        attrs[attr] = okAttr and has or false
++    end
++
++    return setmetatable({
++        name = scanSafeUnitName(targetObj),
++        coalition = okCoalition and coal or nil,
++        desc = desc,
++        typeName = typeName,
++        point = {x = point.x, y = point.y, z = point.z},
++        velocity = {x = velocity.x or 0, y = velocity.y or 0, z = velocity.z or 0},
++        attributes = attrs,
++        liveUnit = targetObj,
++        detectingRadarName = scanSafeUnitName(radar),
++        detectingRadarType = radar and geomGetUnitType(radar) or "UNKNOWN",
++        status = status or "CONFIRMED",
++        lastSeen = now,
++        staleAfterSec = profile.staleAfterSec or 30,
++        trackMemorySec = profile.trackMemorySec or 90,
++        dropDeadTargets = Config.EWRS.radar_scan_model and Config.EWRS.radar_scan_model.drop_dead_targets,
++    }, EWRSContactSnapshot)
++end
++
++-----------------------------------------------------
+ -- EWRS CLASS
+ -----------------------------------------------------
+ EWRS = {}
+@@ -286,6 +472,11 @@
+     o.picture = {}
+     o.bullseye = nil
+     o.menuAdded = {}
++
++    -- Imperfect radar state
++    o.radar_scan_running = Config.EWRS.radar_scan_model and Config.EWRS.radar_scan_model.auto_start or false
++    o.radar_scan_state = {}
++    o.radar_tracks = {}
+     env.info("EWRS: Created for side " .. tostring(side))
+     o:cacheRadars()
+     o:startSearch()
+@@ -427,40 +618,360 @@
+ end
+ 
+ -----------------------------------------------------
+--- Radar Detection
++-- Imperfect Radar Scan / Track Model
+ -----------------------------------------------------
+-function EWRS:detectRadarContacts()
++function EWRS:getRadarKey(radar)
++    local okName, name = pcall(function() return radar:getName() end)
++    if okName and name then
++        return name
++    end
++
++    return geomGetUnitType(radar) .. "_" .. tostring(radar)
++end
++
++function EWRS:getScanProfile(radar)
++    local cfg = Config.EWRS.radar_scan_model
++
++    if not cfg or not cfg.enable then
++        return nil, "SCAN_DISABLED"
++    end
++
++    local unitType = geomGetUnitType(radar)
++
++    if cfg.profiles_by_type and cfg.profiles_by_type[unitType] then
++        return cfg.profiles_by_type[unitType], unitType
++    end
++
++    if cfg.profiles_by_substring then
++        for _, rule in ipairs(cfg.profiles_by_substring) do
++            if rule.match and rule.profile and string.find(unitType, rule.match, 1, true) then
++                return rule.profile, rule.match
++            end
++        end
++    end
++
++    return nil, "UNPROFILED_LIVE"
++end
++
++function EWRS:applyRadarEmissionState(radar, enabled, profile)
++    if not radar or not radar:isExist() then
++        return
++    end
++
++    if not profile or not profile.forceDcsOnOff then
++        return
++    end
++
++    local okController, controller = pcall(function() return radar:getController() end)
++    if not okController or not controller then
++        return
++    end
++
++    pcall(function()
++        if enabled then
++            controller:setOnOff(true)
++            controller:setOption(
++                AI.Option.Ground.id.ALARM_STATE,
++                AI.Option.Ground.val.ALARM_STATE.RED
++            )
++        else
++            controller:setOption(
++                AI.Option.Ground.id.ALARM_STATE,
++                AI.Option.Ground.val.ALARM_STATE.GREEN
++            )
++            controller:setOnOff(false)
++        end
++    end)
++end
++
++function EWRS:initRadarScanState(radar, profile, now)
++    local radarKey = self:getRadarKey(radar)
++    local state = self.radar_scan_state[radarKey]
++
++    if state then
++        return state
++    end
++
++    state = {
++        radarKey = radarKey,
++        radarType = geomGetUnitType(radar),
++        emitting = not profile.useEmissionCycle,
++        nextEmissionSwitch = now + (profile.initialDelaySec or 0),
++        nextScanTime = now + (profile.scanPeriodSec or 10),
++        initializedAt = now,
++    }
++
++    self.radar_scan_state[radarKey] = state
++    self.radar_tracks[radarKey] = self.radar_tracks[radarKey] or {}
++
++    if profile.useEmissionCycle then
++        self:applyRadarEmissionState(radar, false, profile)
++        if Config.EWRS.radar_scan_model.log_state_changes then
++            scanLog(radarKey .. " initialized OFF; first ON in " .. tostring(profile.initialDelaySec or 0) .. " sec")
++        end
++    else
++        self:applyRadarEmissionState(radar, true, profile)
++    end
++
++    return state
++end
++
++function EWRS:updateRadarEmissionCycle(radar, profile, state, now)
++    if not profile.useEmissionCycle then
++        state.emitting = true
++        return true
++    end
++
++    if now >= state.nextEmissionSwitch then
++        state.emitting = not state.emitting
++
++        if state.emitting then
++            local onTime = scanRandomBetween(profile.onMinSec or 25, profile.onMaxSec or 40)
++            state.nextEmissionSwitch = now + onTime
++            self:applyRadarEmissionState(radar, true, profile)
++
++            if Config.EWRS.radar_scan_model.log_state_changes then
++                scanLog(state.radarKey .. " ON for " .. string.format("%.1f", onTime) .. " sec")
++            end
++        else
++            local offTime = scanRandomBetween(profile.offMinSec or 30, profile.offMaxSec or 90)
++            state.nextEmissionSwitch = now + offTime
++            self:applyRadarEmissionState(radar, false, profile)
++
++            if Config.EWRS.radar_scan_model.log_state_changes then
++                scanLog(state.radarKey .. " OFF for " .. string.format("%.1f", offTime) .. " sec")
++            end
++        end
++    end
++
++    return state.emitting
++end
++
++function EWRS:updateTrackFromHit(radarKey, radar, profile, targetObj, now)
++    local targetName = scanSafeUnitName(targetObj)
++    local radarTracks = self.radar_tracks[radarKey]
++    radarTracks[targetName] = radarTracks[targetName] or {
++        hits = 0,
++        misses = 0,
++        confirmed = false,
++        firstSeen = now,
++        lastSeen = now,
++    }
++
++    local track = radarTracks[targetName]
++    track.hits = track.hits + 1
++    track.misses = 0
++    track.lastSeen = now
++
++    local hitsToConfirm = profile.hitsToConfirm or 1
++    if track.hits >= hitsToConfirm then
++        track.confirmed = true
++    end
++
++    local status = track.confirmed and "CONFIRMED" or "TENTATIVE"
++    track.snapshot = scanCaptureSnapshot(targetObj, radar, profile, now, status)
++
++    if Config.EWRS.radar_scan_model.log_tracks then
++        scanLog(string.format("%s hit %s hits=%d confirmed=%s", radarKey, targetName, track.hits, tostring(track.confirmed)))
++    end
++end
++
++function EWRS:updateTrackMisses(radarKey, profile, seenThisScan, now)
++    local radarTracks = self.radar_tracks[radarKey]
++    if not radarTracks then return end
++
++    local trackMemorySec = profile.trackMemorySec or 90
++
++    for targetName, track in pairs(radarTracks) do
++        if not seenThisScan[targetName] then
++            track.misses = (track.misses or 0) + 1
++
++            if profile.requiredConsecutiveHits and not track.confirmed then
++                track.hits = 0
++            end
++
++            if (now - (track.lastSeen or 0)) > trackMemorySec then
++                radarTracks[targetName] = nil
++
++                if Config.EWRS.radar_scan_model.log_tracks then
++                    scanLog(radarKey .. " dropped " .. targetName .. " after memory timeout")
++                end
++            end
++        end
++    end
++end
++
++function EWRS:scanSingleRadar(radar, profile, state, now)
++    local radarKey = state.radarKey
++    local seenThisScan = {}
++
++    if Config.EWRS.radar_scan_model.log_scans then
++        scanLog(radarKey .. " scan")
++    end
++
++    local okActive, active = pcall(function() return radar:isActive() end)
++    if not okActive or not active then
++        self:updateTrackMisses(radarKey, profile, seenThisScan, now)
++        return
++    end
++
++    local okController, controller = pcall(function() return radar:getController() end)
++    if not okController or not controller then
++        self:updateTrackMisses(radarKey, profile, seenThisScan, now)
++        return
++    end
++
++    local okDetected, detected = pcall(function() return controller:getDetectedTargets() end)
++    if not okDetected or not detected then
++        self:updateTrackMisses(radarKey, profile, seenThisScan, now)
++        return
++    end
++
++    for _, target in ipairs(detected) do
++        if target and target.object and target.object.isExist and target.object:isExist() then
++            local targetObj = target.object
++
++            if self:radarCanSeeTarget(radar, targetObj) then
++                local targetName = scanSafeUnitName(targetObj)
++                seenThisScan[targetName] = true
++                self:updateTrackFromHit(radarKey, radar, profile, targetObj, now)
++            end
++        end
++    end
++
++    self:updateTrackMisses(radarKey, profile, seenThisScan, now)
++end
++
++function EWRS:scanRadars()
++    local cfg = Config.EWRS.radar_scan_model
++    if not cfg or not cfg.enable or not self.radar_scan_running then
++        return
++    end
++
++    local now = timer.getTime()
++    local cached_radars = {}
++
++    for _, radar in ipairs(self.radars) do
++        if radar and radar:isExist() then
++            cached_radars[#cached_radars + 1] = radar
++
++            local okCoalition, radarCoalition = pcall(function() return radar:getCoalition() end)
++            local isFriendlyRadar = okCoalition and radarCoalition == self.side
++
++            local profile = self:getScanProfile(radar)
++            if profile and isFriendlyRadar then
++                local state = self:initRadarScanState(radar, profile, now)
++                local emitting = self:updateRadarEmissionCycle(radar, profile, state, now)
++
++                if emitting and now >= state.nextScanTime then
++                    state.nextScanTime = now + (profile.scanPeriodSec or 10)
++                    self:scanSingleRadar(radar, profile, state, now)
++                end
++            end
++        end
++    end
++
++    self.radars = cached_radars
++end
++
++function EWRS:isRadarTrackConfirmed(radar, targetName)
++    local profile = self:getScanProfile(radar)
++    if not profile then
++        return true
++    end
++
++    local radarKey = self:getRadarKey(radar)
++    local radarTracks = self.radar_tracks[radarKey]
++    local track = radarTracks and radarTracks[targetName]
++
++    if not track then
++        return false
++    end
++
++    local now = timer.getTime()
++    local trackMemorySec = profile.trackMemorySec or 90
++
++    return track.confirmed and ((now - (track.lastSeen or 0)) <= trackMemorySec)
++end
++
++function EWRS:getTrackedRadarContacts()
++    local cfg = Config.EWRS.radar_scan_model
++    local now = timer.getTime()
++    local contacts_by_name = {}
++
++    if not cfg or not cfg.enable then
++        return {}
++    end
++
++    for radarKey, tracks in pairs(self.radar_tracks) do
++        for targetName, track in pairs(tracks) do
++            local profileMemory = track.snapshot and track.snapshot.trackMemorySec or 90
++            local age = now - (track.lastSeen or 0)
++
++            if track.confirmed and track.snapshot and age <= profileMemory then
++                local shouldShowTrack = true
++
++                if cfg.show_stale_tracks then
++                    local staleAfterSec = track.snapshot.staleAfterSec or 30
++                    track.snapshot.status = age > staleAfterSec and "STALE" or "CONFIRMED"
++                    track.snapshot.lastSeen = track.lastSeen
++                elseif age > (track.snapshot.staleAfterSec or profileMemory) then
++                    -- Keep the track internally, but do not show stale tracks.
++                    shouldShowTrack = false
++                end
++
++                if shouldShowTrack and ((not cfg.drop_dead_targets) or track.snapshot:isExist()) then
++                    local existing = contacts_by_name[targetName]
++                    if not existing or (track.lastSeen or 0) > (existing.lastSeen or 0) then
++                        contacts_by_name[targetName] = track.snapshot
++                    end
++                end
++            end
++        end
++    end
++
++    local contacts = {}
++    for _, snapshot in pairs(contacts_by_name) do
++        contacts[#contacts + 1] = snapshot
++    end
++
++    return contacts
++end
++
++function EWRS:detectLiveRadarContacts(onlyUnprofiled)
+     local contacts = {}
+     local detected_units = {}
+     local cached_radars = {}
+     local active_count = 0
+-    
+-    env.info("EWRS: Starting detection with " .. #self.radars .. " cached radars")
+-    
++
+     for _, radar in ipairs(self.radars) do
+         if radar and radar:isExist() then
+-            -- Keep inactive radars cached. This matters when external scripts cycle
+-            -- radar emission ON/OFF; otherwise EWRS would forget them until cache refresh.
+             cached_radars[#cached_radars + 1] = radar
+-            
+-            if radar:isActive() then
+-                active_count = active_count + 1
+-                
+-                local controller = radar:getController()
+-                if controller then
+-                    local detected = controller:getDetectedTargets()
+-                    
+-                    if detected then
+-                        for _, target in ipairs(detected) do
+-                            if target and target.object and target.object:isExist() then
+-                                local targetObj = target.object
+-                                
+-                                if self:radarCanSeeTarget(radar, targetObj) then
+-                                    local targetName = targetObj:getName()
+-                                    
+-                                    if not detected_units[targetName] then
+-                                        detected_units[targetName] = true
+-                                        table.insert(contacts, targetObj)
++
++            local okCoalition, radarCoalition = pcall(function() return radar:getCoalition() end)
++            local isFriendlyRadar = okCoalition and radarCoalition == self.side
++
++            local scanProfile = self:getScanProfile(radar)
++            if isFriendlyRadar and ((not onlyUnprofiled) or (not scanProfile)) then
++                if radar:isActive() then
++                    active_count = active_count + 1
++
++                    local controller = radar:getController()
++                    if controller then
++                        local detected = controller:getDetectedTargets()
++
++                        if detected then
++                            for _, target in ipairs(detected) do
++                                if target and target.object and target.object:isExist() then
++                                    local targetObj = target.object
++
++                                    if self:radarCanSeeTarget(radar, targetObj) then
++                                        local targetName = targetObj:getName()
++
++                                        if not detected_units[targetName] then
++                                            detected_units[targetName] = true
++                                            table.insert(contacts, targetObj)
++                                        end
+                                     end
+                                 end
+                             end
+@@ -470,10 +981,66 @@
+             end
+         end
+     end
+-    
++
+     self.radars = cached_radars
+-    
+-    env.info("EWRS: Active radars: " .. active_count .. " / cached radars after cleanup: " .. #self.radars)
++
++    env.info("EWRS: Live active radars: " .. active_count .. " / cached radars: " .. #self.radars)
++    return contacts
++end
++
++function EWRS:startRadarScanModel()
++    self.radar_scan_running = true
++    math.randomseed(math.floor(timer.getAbsTime() * 1000) + self.side)
++    env.info("EWRS: Imperfect radar scan model started for side " .. tostring(self.side))
++end
++
++function EWRS:stopRadarScanModel()
++    self.radar_scan_running = false
++
++    for _, radar in ipairs(self.radars) do
++        if radar and radar:isExist() then
++            local okCoalition, radarCoalition = pcall(function() return radar:getCoalition() end)
++            local profile = self:getScanProfile(radar)
++            if profile and profile.forceDcsOnOff and okCoalition and radarCoalition == self.side then
++                self:applyRadarEmissionState(radar, false, profile)
++            end
++        end
++    end
++
++    env.info("EWRS: Imperfect radar scan model stopped for side " .. tostring(self.side))
++end
++
++-----------------------------------------------------
++-- Radar Detection
++-----------------------------------------------------
++function EWRS:detectRadarContacts()
++    local cfg = Config.EWRS.radar_scan_model
++
++    if cfg and cfg.enable then
++        local contacts = self:getTrackedRadarContacts()
++
++        if cfg.unprofiled_live_passthrough then
++            local liveContacts = self:detectLiveRadarContacts(true)
++            local seen = {}
++
++            for _, c in ipairs(contacts) do
++                seen[c:getName()] = true
++            end
++
++            for _, c in ipairs(liveContacts) do
++                local n = c:getName()
++                if not seen[n] then
++                    contacts[#contacts + 1] = c
++                    seen[n] = true
++                end
++            end
++        end
++
++        env.info("EWRS: Detected " .. #contacts .. " contacts after scan/track model")
++        return contacts
++    end
++
++    local contacts = self:detectLiveRadarContacts(false)
+     env.info("EWRS: Detected " .. #contacts .. " contacts")
+     return contacts
+ end
+@@ -501,7 +1068,17 @@
+                             if target and target.object and target.object:isExist() then
+                                 local targetObj = target.object
+                                 if targetObj:getName() == player_name and self:radarCanSeeTarget(radar, targetObj) then
+-                                    table.insert(tracking_radars, radar)
++                                    -- If this radar has a scan/track profile, training mode only reports it
++                                    -- after the track is confirmed by the same confidence model as EWRS.
++                                    local trackOwner = self
++                                    local okRadarSide, radarSide = pcall(function() return radar:getCoalition() end)
++                                    if okRadarSide and EWRS_coalition and EWRS_coalition[radarSide] then
++                                        trackOwner = EWRS_coalition[radarSide]
++                                    end
++
++                                    if trackOwner:isRadarTrackConfirmed(radar, player_name) then
++                                        table.insert(tracking_radars, radar)
++                                    end
+                                     break
+                                 end
+                             end
+@@ -865,6 +1442,15 @@
+ function EWRS:startSearch()
+     env.info("EWRS: Starting search loop")
+     
++    -- Fast internal scan loop. This builds/ages radar tracks independently of
++    -- the slower EWRS report interval.
++    timer.scheduleFunction(function(arg, time)
++        local this = arg[1]
++        this:scanRadars()
++        return time + (Config.EWRS.radar_scan_model.scheduler_interval or 1)
++    end, {self}, timer.getTime() + 1)
++
++    -- Slow reporting/display loop.
+     timer.scheduleFunction(function(arg, time)
+         local this = arg[1]
+         this:searchTheatre()
+@@ -1357,12 +1943,53 @@
+ end
+ 
+ -----------------------------------------------------
++-- GLOBAL IMPERFECT RADAR CONTROL
++-----------------------------------------------------
++-- Optional trigger controls:
++--   EWRS_IMPERFECT_RADAR.start()
++--   EWRS_IMPERFECT_RADAR.stop()
++--   EWRS_IMPERFECT_RADAR.reset()
++EWRS_IMPERFECT_RADAR = EWRS_IMPERFECT_RADAR or {}
++
++function EWRS_IMPERFECT_RADAR.start()
++    if not EWRS_coalition then return end
++
++    for _, ewrs in pairs(EWRS_coalition) do
++        ewrs:startRadarScanModel()
++    end
++
++    trigger.action.outText("EWRS imperfect radar model started", 10)
++end
++
++function EWRS_IMPERFECT_RADAR.stop()
++    if not EWRS_coalition then return end
++
++    for _, ewrs in pairs(EWRS_coalition) do
++        ewrs:stopRadarScanModel()
++    end
++
++    trigger.action.outText("EWRS imperfect radar model stopped", 10)
++end
++
++function EWRS_IMPERFECT_RADAR.reset()
++    if not EWRS_coalition then return end
++
++    for _, ewrs in pairs(EWRS_coalition) do
++        ewrs.radar_scan_state = {}
++        ewrs.radar_tracks = {}
++        ewrs:startRadarScanModel()
++    end
++
++    trigger.action.outText("EWRS imperfect radar model reset", 10)
++end
++
++-----------------------------------------------------
+ -- HARDENED INITIALIZATION
+ -----------------------------------------------------
+ 
+ if Config.EWRS.enable then
+ 
+-    env.info("EWRS: Initializing HARDENED v11.9 geometry fork")
++    env.info("EWRS: Initializing HARDENED v12.0 imperfect radar fork")
+ 
+     EWRS_coalition = {
+         [coalition.side.BLUE] = EWRS:new(coalition.side.BLUE),
+@@ -1533,7 +2160,7 @@
+ 
+     end, {}, timer.getTime() + 3)
+ 
+-    trigger.action.outText("Lock-On Greece / DCS World Greece - EWRS v11.9 geometry fork", 20)
++    trigger.action.outText("Lock-On Greece / DCS World Greece - EWRS v12.0 imperfect radar fork", 20)
+ 
+ else
+     env.info("EWRS: Disabled")
