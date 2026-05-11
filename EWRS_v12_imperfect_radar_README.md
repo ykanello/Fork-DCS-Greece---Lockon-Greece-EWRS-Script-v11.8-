@@ -1,4 +1,4 @@
-# EWRS v12.0 Imperfect Radar Fork
+# EWRS v12.0 Imperfect Radar Fork - onyames - oh no yet another modded ewrs script
 
 This fork adds two realism layers on top of the EWRS geometry fork:
 
